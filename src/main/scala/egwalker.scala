@@ -58,7 +58,7 @@ def createOpLog[T](): OpLog[T] = {
 
 def pushLocalOp[T](oplog: OpLog[T], agent: String, op: Op[T]) = {
     val seq = oplog.version.getOrElse(agent, -1) + 1
-    val lv = oplog.ops.length
+    val lv = oplog.ops.length.toLong
 
     val stamped = op.withMeta(Id(agent, seq), oplog.frontier)
 
@@ -72,21 +72,64 @@ def pushLocalOp[T](oplog: OpLog[T], agent: String, op: Op[T]) = {
 def localInsert[T](oplog: OpLog[T], agent: String, pos: Int, content: List[T]) = {
     content.zipWithIndex.foldLeft(oplog) { case (log, (c, i)) =>
         val op = Ins(c, pos + i, Id("tmp", 0), Nil)
-        pushLocalOp(oplog, agent, op)
+        pushLocalOp(log, agent, op)
     }
 }
 
 def localDelete[T](oplog: OpLog[T], agent: String, pos: Int, delLen: Int) = {
     (0 until delLen).foldLeft(oplog) { case (log, i) =>
         val op = Del(pos + i, Id("tmp", 0), Nil)
-        pushLocalOp(oplog, agent, op)
+        pushLocalOp(log, agent, op)
+    }
+}
+
+/**
+  * Returns index in oplog (LV) where the given id is associated with the op
+  */
+def idToLV[T](oplog: OpLog[T], id: Id): LV = {
+    val idx = oplog.ops.indexWhere(op => op.id.equals(id))
+    if (idx < 0) throw Error("Could not find id in oplog")
+    return idx.toLong
+}
+
+def advanceFrontier(frontier: List[LV], lv: LV, parents: List[LV]): List[LV] = {
+    val f = frontier.filter(v => parents.contains(v)) // parents have a out-degree >= 1
+    f :+ lv
+    return f.sorted
+}
+
+def pushRemoteOp[T](oplog: OpLog[T], op: Op[T], parentIds: List[Id]): Unit = {
+    val Id(agent, seq) = op.id
+    val lastKnownSeq = oplog.version.getOrElse(agent, -1) 
+    if (lastKnownSeq >= seq) return // return a no-op if agent already has the op
+
+    val lv = oplog.ops.length.toLong
+    val parents = parentIds.map(id => idToLV(oplog, id)).sorted
+
+    oplog.ops :+ op.withMeta(op.id, parents)
+    if (seq.!=(lastKnownSeq + 1)) throw Error("Sequence numbers are out of order")
+    oplog.copy(
+        oplog.ops,
+        frontier = advanceFrontier(oplog.frontier, lv, parents),
+        version = oplog.version.updated(agent, seq)
+    )
+}
+
+/**
+ * Copies operations from source to dest if missing in dest client
+ * Assumes work done in-memory; a proper server-side implementation would compare remote versions
+ */
+def mergeInto[T](dest: OpLog[T], src: OpLog[T]) = {
+    for (op <- src.ops) {
+        val parentIds = op.parents.map(lv => src.ops(lv.toInt).id) // map to the source version
+        pushRemoteOp(dest, op, parentIds)
     }
 }
 
 object Main {
     def main(args: Array[String]): Unit = {
-        val oplog0 = createOpLog[String]() // Scala type inference initializes an Oplog with content of string
-        val oplog1 = localInsert(oplog0, "kez", 0, List("hello"))
+        val oplog0 = createOpLog[Char]() // Scala type inference initializes an Oplog with content of string
+        val oplog1 = localInsert(oplog0, "kez", 0, "hello".toList)
     
         println(oplog1.ops)
     }
